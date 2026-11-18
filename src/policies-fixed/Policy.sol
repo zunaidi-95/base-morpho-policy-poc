@@ -1,0 +1,317 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.23;
+
+import {PolicyManager} from "../PolicyManager.sol";
+
+/// @title Policy
+///
+/// @notice Base hook interface for policies managed by `PolicyManager`.
+///
+/// @dev Policies define authorization semantics and return an account call plan for execution. All external entrypoints
+///      are callable only by the `PolicyManager`.
+abstract contract Policy {
+    ////////////////////////////////////////////////////////////////
+    ///                         Types                            ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @notice Identifies whether a policy is being invoked as the old (uninstalled) or new (installed) side of a
+    ///         replacement operation.
+    ///
+    /// @dev `PolicyManager.replace` and `PolicyManager.replaceWithSignature` will call `onReplace` on both the old and
+    ///      new policies, passing the appropriate role value. Policies SHOULD prefer overriding the role-specific
+    ///      `_onUninstallForReplace` / `_onInstallForReplace` hooks rather than branching on `role` themselves.
+    enum ReplaceRole {
+        OldPolicy,
+        NewPolicy
+    }
+
+    ////////////////////////////////////////////////////////////////
+    ///                    Constants/Storage                     ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @dev The `PolicyManager` instance authorized to call hooks.
+    PolicyManager public immutable policyManager;
+
+    ////////////////////////////////////////////////////////////////
+    ///                         Errors                           ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @notice Thrown when a caller restriction is violated.
+    ///
+    /// @param caller Actual caller.
+    /// @param expected Expected sender.
+    error InvalidCaller(address caller, address expected);
+
+    /// @notice Thrown when a provided PolicyManager address has no deployed code.
+    ///
+    /// @param policyManager The address that was rejected.
+    error PolicyManagerNotContract(address policyManager);
+
+    ////////////////////////////////////////////////////////////////
+    ///                        Modifiers                         ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @notice Restricts execution to the configured PolicyManager.
+    modifier onlyPolicyManager() {
+        _requireSender(address(policyManager));
+        _;
+    }
+
+    ////////////////////////////////////////////////////////////////
+    ///                       Constructor                        ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @notice Constructs the policy and sets its manager.
+    ///
+    /// @param policyManager_ Address of the `PolicyManager` authorized to call this policy's hooks.
+    constructor(address policyManager_) {
+        if (_isNotPersistentCode(policyManager_)) revert PolicyManagerNotContract(policyManager_);
+        policyManager = PolicyManager(policyManager_);
+    }
+
+    ////////////////////////////////////////////////////////////////
+    ///                    External Functions                    ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @notice Policy hook invoked during installation.
+    ///
+    /// @dev MUST revert if the policy refuses the installation.
+    ///
+    /// `policyId` is the EIP-712 struct hash of `binding` as computed by `PolicyManager`.
+    /// `policyConfig` is the config bytes from the binding.
+    ///
+    /// @param policyId Deterministic policy identifier derived from the binding.
+    /// @param account Account that installed the policy.
+    /// @param policyConfig Full config preimage bytes.
+    function onInstall(bytes32 policyId, address account, bytes calldata policyConfig) external onlyPolicyManager {
+        _onInstall(policyId, account, policyConfig);
+    }
+
+    /// @notice Authorize the execution and build the account call and optional post-call.
+    ///
+    /// @dev This hook is called only when execution is intended: via `execute()`, or via
+    ///      `installWithSignature` / `replaceWithSignature` when non-empty `executionData` is provided.
+    ///      The PolicyManager gates execution at the callsite — install-only flows (empty `executionData`)
+    ///      never reach this hook.
+    ///
+    ///      If the policy returns empty `accountCallData`, the PolicyManager treats it as a no-op: no account call,
+    ///      no `onPostExecute`, and no `PolicyExecuted` event.
+    ///
+    ///      The validity window is enforced by the manager before this hook is called. Policies do not need to
+    ///      check it. Policy-specific execution preconditions (time-locks, nonce guards, oracle state, etc.)
+    ///      should revert on failure — reverts are always meaningful errors, never install-flow artifacts.
+    ///
+    /// @param policyId Policy identifier for the binding.
+    /// @param account Account that authorized this policy instance.
+    /// @param policyConfig Policy-defined config bytes (often the config preimage).
+    /// @param executionData Policy-defined per-execution payload. For push-the-button policies this may be empty
+    ///        (signaling "go"); for data-bearing policies it carries the action parameters.
+    /// @param caller External caller that invoked the manager.
+    ///
+    /// @return accountCallData ABI-encoded calldata to execute on the account (or empty for no-op).
+    /// @return postCallData Opaque bytes forwarded to `onPostExecute` after the account call (may be empty; policies must handle gracefully).
+    function onExecute(
+        bytes32 policyId,
+        address account,
+        bytes calldata policyConfig,
+        bytes calldata executionData,
+        address caller
+    ) external onlyPolicyManager returns (bytes memory accountCallData, bytes memory postCallData) {
+        return _onExecute(policyId, account, policyConfig, executionData, caller);
+    }
+
+    /// @notice Policy hook invoked by the PolicyManager after the account call in `_execute`.
+    ///
+    /// @dev Called whenever `onExecute` returns non-empty `accountCallData`. `postCallData` may be empty;
+    ///      implementations must handle that case gracefully.
+    ///      Default implementation is a no-op; policies that need post-execution logic MUST override `_onPostExecute`.
+    ///
+    /// @param policyId Policy identifier for the binding.
+    /// @param account Account associated with the policyId.
+    /// @param postCallData Policy-defined post-call payload returned by `onExecute`.
+    function onPostExecute(bytes32 policyId, address account, bytes calldata postCallData) external onlyPolicyManager {
+        _onPostExecute(policyId, account, postCallData);
+    }
+
+    /// @notice Policy hook invoked during uninstallation.
+    ///
+    /// @dev Called by `PolicyManager` after the binding has been marked uninstalled.
+    ///      MAY also be called to permanently disable a policyId before installation (pre-install uninstallation),
+    ///      in which case `policyConfig` is expected to be the full config preimage bytes.
+    ///
+    /// `policyConfig` MAY be empty. Policies can use it to re-hydrate authorization (e.g., dynamic executors)
+    /// without requiring additional stored state.
+    ///
+    /// @param policyId Policy identifier for the binding.
+    /// @param account Account associated with the policyId.
+    /// @param policyConfig Optional policy-defined config bytes (often the config preimage).
+    /// @param uninstallData Optional policy-defined authorization payload.
+    /// @param effectiveCaller Effective caller forwarded by the manager.
+    function onUninstall(
+        bytes32 policyId,
+        address account,
+        bytes calldata policyConfig,
+        bytes calldata uninstallData,
+        address effectiveCaller
+    ) external onlyPolicyManager {
+        _onUninstall(policyId, account, policyConfig, uninstallData, effectiveCaller);
+    }
+
+    /// @notice Policy hook invoked during atomic replacement.
+    ///
+    /// @dev Called by `PolicyManager.replace` / `PolicyManager.replaceWithSignature` in lieu of separate `onUninstall`
+    ///      + `onInstall`
+    ///      calls so a policy can distinguish replacement from standalone lifecycle transitions.
+    ///
+    ///      The manager passes each policy its own dedicated `replaceData` blob — old and new policies receive
+    ///      independent payloads so they can be developed without knowledge of each other.
+    ///
+    /// Default behavior:
+    /// - `role == OldPolicy`: delegates to `_onUninstallForReplace(policyId, account, policyConfig, replaceData, otherPolicy, otherPolicyId)`
+    /// - `role == NewPolicy`: delegates to `_onInstallForReplace(policyId, account, policyConfig, replaceData, otherPolicy, otherPolicyId)`
+    ///
+    /// @param policyId Policy identifier for this policy instance (old or new depending on `role`).
+    /// @param account Account associated with the replacement.
+    /// @param policyConfig Config bytes for this policy instance.
+    /// @param replaceData Policy-specific replacement payload (each policy receives its own independent blob from the
+    ///        `ReplacePayload`). NOT signed over by the account — the transaction submitter can supply arbitrary
+    ///        values. Policies that rely on this blob for authorization MUST independently validate it (e.g., by
+    ///        requiring a scoped executor signature within the blob).
+    ///        For `role == OldPolicy`, default implementation forwards this as `uninstallData`.
+    ///        For `role == NewPolicy`, default implementation ignores it.
+    /// @param otherPolicy The other policy contract involved in the replacement.
+    /// @param otherPolicyId The other policyId involved in the replacement.
+    /// @param role Whether this hook is being invoked for the old policy or the new policy.
+    function onReplace(
+        bytes32 policyId,
+        address account,
+        bytes calldata policyConfig,
+        bytes calldata replaceData,
+        address otherPolicy,
+        bytes32 otherPolicyId,
+        ReplaceRole role
+    ) external onlyPolicyManager {
+        if (role == ReplaceRole.OldPolicy) {
+            _onUninstallForReplace(policyId, account, policyConfig, replaceData, otherPolicy, otherPolicyId);
+        } else {
+            _onInstallForReplace(policyId, account, policyConfig, replaceData, otherPolicy, otherPolicyId);
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////
+    ///                    Internal Functions                    ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @dev Policy-specific install hook. Revert to refuse installation.
+    function _onInstall(bytes32 policyId, address account, bytes calldata policyConfig) internal virtual;
+
+    /// @dev Policy-specific execute hook. Called only when execution is intended — the manager never calls this for
+    ///      install-only flows. The validity window has already been enforced by the manager before this hook is
+    ///      called. Policies branch on config (not on data presence) to determine execution behavior. Revert to
+    ///      refuse execution.
+    function _onExecute(
+        bytes32 policyId,
+        address account,
+        bytes calldata policyConfig,
+        bytes calldata executionData,
+        address caller
+    ) internal virtual returns (bytes memory accountCallData, bytes memory postCallData);
+
+    /// @dev Policy-specific post-execute hook. Called after the account call completes.
+    ///      Default is a no-op; override to implement post-execution logic.
+    function _onPostExecute(bytes32 policyId, address account, bytes calldata postCallData) internal virtual {
+        policyId;
+        account;
+        postCallData;
+    }
+
+    /// @dev Policy-specific uninstall hook. Revert to refuse unauthorized uninstallation.
+    ///      `PolicyManager.uninstall` is callable by ANY address — the manager relies on this hook to enforce
+    ///      authorization. If this hook reverts and the caller is the bound account, the manager swallows the
+    ///      revert (account escape hatch); otherwise the revert propagates. Implementations MUST validate
+    ///      `effectiveCaller` and revert for unauthorized callers.
+    function _onUninstall(
+        bytes32 policyId,
+        address account,
+        bytes calldata policyConfig,
+        bytes calldata uninstallData,
+        address caller
+    ) internal virtual;
+
+    /// @notice Policy-specific replacement uninstall hook.
+    ///
+    /// @dev Override to implement replacement-aware uninstallation logic.
+    ///
+    /// Default behavior: delegates to `_onUninstall(..., uninstallData=replaceData, caller=account)`.
+    /// The account is always the effective caller during replacement because the account authorized the operation
+    /// (directly via `replace()` or via signature in `replaceWithSignature()`).
+    ///
+    /// @param policyId Policy identifier for this (old) policy instance.
+    /// @param account Account associated with the replacement.
+    /// @param policyConfig Config bytes for this policy instance.
+    /// @param replaceData The old policy's dedicated replacement payload (`oldPolicyReplaceData` from the
+    ///        `ReplacePayload`). Default implementation forwards this as `uninstallData` to `_onUninstall`.
+    /// @param otherPolicy The other policy contract involved in the replacement.
+    /// @param otherPolicyId The other policyId involved in the replacement.
+    function _onUninstallForReplace(
+        bytes32 policyId,
+        address account,
+        bytes calldata policyConfig,
+        bytes calldata replaceData,
+        address otherPolicy,
+        bytes32 otherPolicyId
+    ) internal virtual {
+        otherPolicy;
+        otherPolicyId;
+        _onUninstall(policyId, account, policyConfig, replaceData, account);
+    }
+
+    /// @notice Policy-specific replacement install hook.
+    ///
+    /// @dev Override to implement replacement-aware installation logic.
+    ///
+    /// Default behavior: delegates to `_onInstall(...)`.
+    ///
+    /// @param policyId Policy identifier for this (new) policy instance.
+    /// @param account Account associated with the replacement.
+    /// @param policyConfig Config bytes for this policy instance.
+    /// @param replaceData The new policy's dedicated replacement payload (`newPolicyReplaceData` from the
+    ///        `ReplacePayload`). Default implementation ignores this value.
+    /// @param otherPolicy The other policy contract involved in the replacement.
+    /// @param otherPolicyId The other policyId involved in the replacement.
+    function _onInstallForReplace(
+        bytes32 policyId,
+        address account,
+        bytes calldata policyConfig,
+        bytes calldata replaceData,
+        address otherPolicy,
+        bytes32 otherPolicyId
+    ) internal virtual {
+        replaceData;
+        otherPolicy;
+        otherPolicyId;
+        _onInstall(policyId, account, policyConfig);
+    }
+
+    ////////////////////////////////////////////////////////////////
+    ///                 Internal View Functions                  ///
+    ////////////////////////////////////////////////////////////////
+
+    /// @dev Requires `msg.sender` to equal `sender`.
+    function _requireSender(address sender) internal view {
+        if (msg.sender != sender) revert InvalidCaller(msg.sender, sender);
+    }
+
+    /// @notice Returns true if `addr` has no deployed code or has an EIP-7702 delegation indicator.
+    ///
+    /// @dev EIP-7702 delegation indicators are exactly 23 bytes starting with `0xef0100`. Such addresses are EOAs
+    ///      that have delegated their code to another contract and may revoke the delegation at any time.
+    ///      Infrastructure addresses (PolicyManager, vaults, Morpho) must be permanently deployed contracts.
+    function _isNotPersistentCode(address addr) internal view returns (bool) {
+        bytes memory code = addr.code;
+        if (code.length == 0) return true;
+        if (code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00) return true;
+        return false;
+    }
+}
+
